@@ -201,6 +201,7 @@ class TalkieModel(nn.Module):
         t: float = 0.7,
         top_p: torch.Tensor | None = None,
         top_k: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Sample one token per sequence in the batch."""
         logits = self.forward(x)
@@ -208,7 +209,9 @@ class TalkieModel(nn.Module):
             logits = logits / t
         if top_p is not None or top_k is not None:
             logits = apply_top_k_top_p(logits, top_p=top_p, top_k=top_k)
-        logits = logits + sample_gumbel(logits.shape, self.device)
+        logits = logits + sample_gumbel(
+            logits.shape, self.device, generator=generator
+        )
         return torch.argmax(logits, dim=-1)
 
     def sample_batch_variable_temp(
@@ -217,13 +220,27 @@ class TalkieModel(nn.Module):
         t: torch.Tensor,
         top_p: torch.Tensor | None = None,
         top_k: torch.Tensor | None = None,
+        generator: torch.Generator | list[torch.Generator | None] | None = None,
     ) -> torch.Tensor:
         """Like :meth:`sample_batch` but *t* is a ``[B, 1]`` per-sequence temperature."""
         logits = self.forward(x)
         logits = logits / t
         if top_p is not None or top_k is not None:
             logits = apply_top_k_top_p(logits, top_p=top_p, top_k=top_k)
-        logits = logits + sample_gumbel(logits.shape, self.device)
+        if isinstance(generator, list):
+            noise = torch.stack(
+                [
+                    sample_gumbel(
+                        logits[i].shape, self.device, generator=generator[i]
+                    )
+                    for i in range(logits.shape[0])
+                ]
+            )
+        else:
+            noise = sample_gumbel(
+                logits.shape, self.device, generator=generator
+            )
+        logits = logits + noise
         return torch.argmax(logits, dim=-1)
 
 

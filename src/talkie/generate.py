@@ -34,6 +34,7 @@ class GenerationConfig:
     max_tokens: int = 256
     top_p: float | None = None
     top_k: int | None = None
+    seed: int | None = None
 
 
 @dataclass
@@ -43,6 +44,16 @@ class GenerationResult:
     text: str
     token_count: int
     finish_reason: Literal["stop", "length"]
+
+
+def _make_generator(
+    seed: int | None, device: torch.device
+) -> torch.Generator | None:
+    if seed is None:
+        return None
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed))
+    return g
 
 
 class Talkie:
@@ -115,6 +126,7 @@ class Talkie:
         max_tokens: int = 256,
         top_p: float | None = None,
         top_k: int | None = None,
+        seed: int | None = None,
     ) -> GenerationResult:
         """Generate a completion and return the full result.
 
@@ -128,6 +140,7 @@ class Talkie:
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            seed=seed,
         ):
             tokens.append(tok)
         text = "".join(tokens)
@@ -142,6 +155,7 @@ class Talkie:
         max_tokens: int = 256,
         top_p: float | None = None,
         top_k: int | None = None,
+        seed: int | None = None,
     ) -> Generator[str, None, None]:
         """Stream tokens one at a time.
 
@@ -153,7 +167,7 @@ class Talkie:
         else:
             formatted = prompt
         yield from self._stream_raw(
-            formatted, temperature, max_tokens, top_p, top_k
+            formatted, temperature, max_tokens, top_p, top_k, seed=seed
         )
 
     def chat(
@@ -163,6 +177,7 @@ class Talkie:
         max_tokens: int = 256,
         top_p: float | None = None,
         top_k: int | None = None,
+        seed: int | None = None,
     ) -> GenerationResult:
         """Multi-turn chat completion (IT model only).
 
@@ -176,6 +191,7 @@ class Talkie:
             max_tokens=max_tokens,
             top_p=top_p,
             top_k=top_k,
+            seed=seed,
         ):
             tokens.append(tok)
         text = "".join(tokens)
@@ -189,12 +205,13 @@ class Talkie:
         max_tokens: int = 256,
         top_p: float | None = None,
         top_k: int | None = None,
+        seed: int | None = None,
     ) -> Generator[str, None, None]:
         """Stream a multi-turn chat reply token-by-token (IT model only)."""
         self._require_it("chat_stream")
         formatted = format_chat(messages)
         yield from self._stream_raw(
-            formatted, temperature, max_tokens, top_p, top_k
+            formatted, temperature, max_tokens, top_p, top_k, seed=seed
         )
 
     def batch_generate(
@@ -229,6 +246,11 @@ class Talkie:
             self.model.config.vocab_size,
             self.device,
         )
+        generators = (
+            [_make_generator(c.seed, self.device) for c in configs]
+            if any(c.seed is not None for c in configs)
+            else None
+        )
         max_per = [c.max_tokens for c in configs]
         global_max = max(max_per)
 
@@ -239,7 +261,11 @@ class Talkie:
         with torch.no_grad(), self._autocast:
             for _ in range(global_max):
                 next_tokens = self.model.sample_batch_variable_temp(
-                    tokens_tensor, temps, top_p=top_p_t, top_k=top_k_t
+                    tokens_tensor,
+                    temps,
+                    top_p=top_p_t,
+                    top_k=top_k_t,
+                    generator=generators,
                 )
                 next_tokens = next_tokens.unsqueeze(1)
                 tokens_tensor = torch.cat([tokens_tensor, next_tokens], dim=1)
@@ -293,6 +319,7 @@ class Talkie:
         max_tokens: int,
         top_p: float | None,
         top_k: int | None,
+        seed: int | None = None,
     ) -> Generator[str, None, None]:
         """Stream tokens from an already-formatted prompt string."""
         tokens = self.tokenizer.encode(formatted_prompt, allowed_special="all")
@@ -302,6 +329,7 @@ class Talkie:
 
         top_p_t = scalar_top_p_tensor(top_p, self.device)
         top_k_t = scalar_top_k_tensor(top_k, self.device)
+        gen = _make_generator(seed, self.device)
 
         is_it = self.spec.style == "it"
         buffered_text = ""
@@ -309,7 +337,11 @@ class Talkie:
         with torch.no_grad(), self._autocast:
             for _ in range(max_tokens):
                 next_token = self.model.sample_batch(
-                    tokens_tensor, t=temperature, top_p=top_p_t, top_k=top_k_t
+                    tokens_tensor,
+                    t=temperature,
+                    top_p=top_p_t,
+                    top_k=top_k_t,
+                    generator=gen,
                 )[0]
                 next_token_tensor = torch.tensor(
                     [[next_token]], device=self.device

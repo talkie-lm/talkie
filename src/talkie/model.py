@@ -272,7 +272,7 @@ def load_checkpoint(
     Builds and converts to bfloat16 on CPU first, then moves to GPU to
     avoid a transient 2x memory spike from float32 initialisation.
     """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", mmap=True)
     if "model_state_dict" in ckpt:
         state_dict = ckpt["model_state_dict"]
     elif "model" in ckpt:
@@ -287,13 +287,14 @@ def load_checkpoint(
     # Build on CPU, load weights, convert to bfloat16, THEN move to GPU.
     cpu = torch.device("cpu")
     model = TalkieModel(config, cpu)
+    model = model.to(dtype=torch.bfloat16)
     model.load_state_dict(state_dict, strict=True)
     del ckpt, state_dict
 
     if target_vocab_size is not None and ckpt_vocab_size < target_vocab_size:
         model = resize_model_embeddings(model, target_vocab_size, cpu)
 
-    model = model.to(dtype=torch.bfloat16).to(device)
+    model = model.to(device)
     model.device = device
     model.eval()
     return model

@@ -50,11 +50,15 @@ def main() -> None:
         }
     config.update(
         {
+            "model_type": "talkie",
             "rope_base": 1_000_000.0,
             "max_seq_len": 2048,
             "dtype": "bfloat16",
             "style": "it" if int(config["vocab_size"]) > 65536 else "base",
-            "architectures": ["TalkieModel"],
+            "eos_token_id": [65535, 65536, 65537, 65539]
+            if int(config["vocab_size"]) > 65536
+            else 65535,
+            "architectures": ["TalkieForCausalLM"],
             "source_repo": args.source_repo,
             "source_checkpoint": checkpoint.name,
             "mlx_runtime": "talkie.mlx",

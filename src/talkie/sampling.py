@@ -6,10 +6,13 @@ import torch
 
 
 def sample_gumbel(
-    shape: tuple, device: torch.device, eps: float = 1e-20
+    shape: tuple,
+    device: torch.device,
+    eps: float = 1e-20,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Draw Gumbel(0, 1) noise for the Gumbel-max trick."""
-    u = torch.rand(shape, device=device)
+    u = torch.rand(shape, device=device, generator=generator)
     return -torch.log(-torch.log(u + eps) + eps)
 
 

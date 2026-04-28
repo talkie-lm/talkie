@@ -27,6 +27,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     gen.add_argument("--top-p", type=float, default=None, help="Nucleus sampling p.")
     gen.add_argument("--top-k", type=int, default=None, help="Top-k filtering.")
+    gen.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducible generation."
+    )
     gen.add_argument("--device", default=None, help="Device (cuda / cpu).")
     gen.add_argument("--cache-dir", default=None, help="HuggingFace cache directory.")
     gen.add_argument(
@@ -46,6 +49,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     ch.add_argument("--top-p", type=float, default=None, help="Nucleus sampling p.")
     ch.add_argument("--top-k", type=int, default=None, help="Top-k filtering.")
+    ch.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducible generation."
+    )
     ch.add_argument("--device", default=None, help="Device (cuda / cpu).")
     ch.add_argument("--cache-dir", default=None, help="HuggingFace cache directory.")
     ch.add_argument("--system", default=None, help="System prompt.")
@@ -93,6 +99,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             top_p=args.top_p,
             top_k=args.top_k,
+            seed=args.seed,
         )
         print(result.text)
     else:
@@ -102,6 +109,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             top_p=args.top_p,
             top_k=args.top_k,
+            seed=args.seed,
         ):
             print(token, end="", flush=True)
         print()
@@ -136,6 +144,7 @@ def _cmd_chat(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             top_p=args.top_p,
             top_k=args.top_k,
+            seed=args.seed,
         ):
             print(token, end="", flush=True)
             reply_parts.append(token)

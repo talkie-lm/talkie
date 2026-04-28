@@ -12,8 +12,16 @@ dependencies = [
     "huggingface-hub>=0.20.0",
 ]
 
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.31.0",
+    "numpy",
+    "safetensors>=0.7.0",
+]
+
 [project.scripts]
 talkie = "talkie.cli:main"
+talkie-mlx = "talkie.mlx.cli:main"
 
 [project.urls]
 Repository = "https://github.com/talkie-lm/talkie"

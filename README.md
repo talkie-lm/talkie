@@ -39,6 +39,32 @@ uv sync
 - CUDA GPU with >= 28 GB VRAM (bfloat16 inference)
 - ~26-50 GB disk space per model
 
+### Apple Silicon / MLX
+
+Talkie also includes an optional MLX backend for Apple Silicon Macs. Install the optional extra:
+
+```bash
+uv sync --extra mlx
+```
+
+Download or convert an MLX-format Talkie directory, then run:
+
+```bash
+uv run talkie-mlx --model-dir /path/to/talkie-1930-13b-it-mlx \
+  --max-tokens 80 \
+  "Write a short note about radio."
+```
+
+To convert a PyTorch checkpoint yourself:
+
+```bash
+uv run python scripts/convert_to_mlx.py \
+  --checkpoint /path/to/rl-refined.pt \
+  --vocab /path/to/vocab.txt \
+  --out-dir /path/to/talkie-1930-13b-it-mlx \
+  --source-repo talkie-lm/talkie-1930-13b-it
+```
+
 ## Quick Start
 
 ### Python API

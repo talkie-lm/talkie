@@ -45,6 +45,23 @@ class GenerationResult:
     finish_reason: Literal["stop", "length"]
 
 
+@dataclass
+class PerplexityResult:
+    """Per-token statistics from one perplexity evaluation pass.
+
+    *log_softmax* holds the full ``[T-1, vocab_size]`` log-probability matrix
+    on CPU so that two passes (e.g. bf16 vs int8) can be compared via KL
+    divergence.  At fp32 / 65k vocab / 1024 tokens this is ~256 MB.
+    """
+
+    perplexity: float
+    n_tokens: int
+    nll: torch.Tensor
+    top1: torch.Tensor
+    top5: torch.Tensor
+    log_softmax: torch.Tensor
+
+
 class Talkie:
     """Main inference interface for Talkie 13B models.
 
@@ -59,6 +76,11 @@ class Talkie:
         PyTorch device string.  Defaults to ``"cuda"`` if available.
     cache_dir:
         Custom HuggingFace cache directory.
+    max_seq_len:
+        Maximum sequence length the model is built for.  Controls the
+        size of the precomputed rotary cos/sin buffers.  Defaults to
+        2048; larger values let you feed longer prompts but quality
+        past the model's training length depends on RoPE extrapolation.
     """
 
     def __init__(
@@ -66,6 +88,7 @@ class Talkie:
         model_name: str,
         device: str | None = None,
         cache_dir: str | None = None,
+        max_seq_len: int = 2048,
     ):
         if model_name not in MODELS:
             available = ", ".join(sorted(MODELS))
@@ -88,7 +111,10 @@ class Talkie:
 
         # Load model.
         self.model = load_checkpoint(
-            str(ckpt_path), self.device, target_vocab_size=target_vocab
+            str(ckpt_path),
+            self.device,
+            target_vocab_size=target_vocab,
+            max_seq_len=max_seq_len,
         )
 
         # Stop tokens.
@@ -195,6 +221,73 @@ class Talkie:
         formatted = format_chat(messages)
         yield from self._stream_raw(
             formatted, temperature, max_tokens, top_p, top_k
+        )
+
+    def perplexity(
+        self,
+        text: str | None = None,
+        max_tokens: int = 1024,
+        last_k: int | None = None,
+        tokens: list[int] | None = None,
+    ) -> PerplexityResult:
+        """Evaluate perplexity on a passage of plain text.
+
+        The text is tokenized as raw BPE (no chat template, no special
+        tokens), truncated to ``min(max_tokens, model.max_seq_len)``, and
+        run through one forward pass.
+
+        Pass *last_k* to score only the final K tokens (the rest of the
+        input is context only).  This is the standard setup for
+        context-length sweeps: keep the eval window fixed, vary the
+        amount of preceding context.
+
+        Pass *tokens* directly to skip re-tokenization (handy when
+        sweeping different slices of the same long text).
+        """
+        if tokens is None:
+            if text is None:
+                raise ValueError("Provide either text or tokens.")
+            tokens = self.tokenizer.encode(text, disallowed_special=())
+        n_max = min(max_tokens, self.model.max_seq_len)
+        if len(tokens) > n_max:
+            tokens = tokens[:n_max]
+        if len(tokens) < 2:
+            raise ValueError(
+                "Need at least 2 tokens to compute perplexity; "
+                f"got {len(tokens)}."
+            )
+
+        eval_k = (
+            len(tokens) - 1 if last_k is None else min(last_k, len(tokens) - 1)
+        )
+
+        input_ids = torch.tensor(
+            [tokens], dtype=torch.long, device=self.device
+        )
+
+        with torch.no_grad(), self._autocast:
+            # Need eval_k+1 logits to predict eval_k tokens; the last logit
+            # would predict beyond the input and is dropped.
+            logits = self.model.forward(input_ids, last_k=eval_k + 1)
+
+        eval_logits = logits[0, :-1]  # [eval_k, V]
+        log_softmax = torch.log_softmax(eval_logits.float(), dim=-1)
+        targets = torch.tensor(
+            tokens[-eval_k:], dtype=torch.long, device=self.device
+        )
+        nll = -log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)
+        perplexity = nll.mean().exp().item()
+
+        top5 = log_softmax.topk(5, dim=-1).indices
+        top1 = top5[:, 0]
+
+        return PerplexityResult(
+            perplexity=perplexity,
+            n_tokens=eval_k,
+            nll=nll.cpu(),
+            top1=top1.cpu(),
+            top5=top5.cpu(),
+            log_softmax=log_softmax.cpu(),
         )
 
     def batch_generate(

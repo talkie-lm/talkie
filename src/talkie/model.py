@@ -242,18 +242,26 @@ def resize_model_embeddings(
     if old_vocab_size >= new_vocab_size:
         return model
 
-    new_embed = nn.Embedding(new_vocab_size, n_embd, device=device)
+    embed_dtype = model.embed.weight.dtype
+    new_embed = nn.Embedding(new_vocab_size, n_embd, device=device, dtype=embed_dtype)
     new_embed.weight.data[:old_vocab_size] = model.embed.weight.data
     new_embed.weight.data[old_vocab_size:] = (
-        torch.randn(new_vocab_size - old_vocab_size, n_embd, device=device) * 0.02
+        torch.randn(
+            new_vocab_size - old_vocab_size, n_embd, device=device, dtype=embed_dtype
+        )
+        * 0.02
     )
     model.embed = new_embed
 
     old_lm_head = model.lm_head.data
-    new_lm_head = torch.zeros(new_vocab_size, n_embd, device=device)
+    lm_head_dtype = old_lm_head.dtype
+    new_lm_head = torch.zeros(new_vocab_size, n_embd, device=device, dtype=lm_head_dtype)
     new_lm_head[:old_vocab_size] = old_lm_head
     new_lm_head[old_vocab_size:] = (
-        torch.randn(new_vocab_size - old_vocab_size, n_embd, device=device) * 0.02
+        torch.randn(
+            new_vocab_size - old_vocab_size, n_embd, device=device, dtype=lm_head_dtype
+        )
+        * 0.02
     )
     model.lm_head = nn.Parameter(new_lm_head)
 
@@ -269,10 +277,12 @@ def load_checkpoint(
     """Load a Talkie model from a PyTorch checkpoint file.
 
     Handles ``torch.compile`` key prefixes and optional vocab resizing.
-    Builds and converts to bfloat16 on CPU first, then moves to GPU to
-    avoid a transient 2x memory spike from float32 initialisation.
+    Builds parameters on the ``meta`` device (zero memory), then loads the
+    bfloat16 checkpoint tensors directly onto ``device`` via ``assign=True``
+    so we never hold a second full copy. Avoids OOM on unified-memory
+    Apple Silicon where CPU and GPU share one pool.
     """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location=device)
     if "model_state_dict" in ckpt:
         state_dict = ckpt["model_state_dict"]
     elif "model" in ckpt:
@@ -284,16 +294,19 @@ def load_checkpoint(
     ckpt_vocab_size = state_dict["embed.weight"].shape[0]
     config = GPTConfig(vocab_size=ckpt_vocab_size)
 
-    # Build on CPU, load weights, convert to bfloat16, THEN move to GPU.
-    cpu = torch.device("cpu")
-    model = TalkieModel(config, cpu)
-    model.load_state_dict(state_dict, strict=True)
+    with torch.device("meta"):
+        model = TalkieModel(config, device)
+    model.load_state_dict(state_dict, strict=True, assign=True)
     del ckpt, state_dict
 
-    if target_vocab_size is not None and ckpt_vocab_size < target_vocab_size:
-        model = resize_model_embeddings(model, target_vocab_size, cpu)
+    # Non-persistent rotary buffers were built on `meta`; rebuild on real device.
+    cos, sin = model._precompute_rotary_embeddings(2048, config.head_dim)
+    model.register_buffer("cos", cos, persistent=False)
+    model.register_buffer("sin", sin, persistent=False)
 
-    model = model.to(dtype=torch.bfloat16).to(device)
+    if target_vocab_size is not None and ckpt_vocab_size < target_vocab_size:
+        model = resize_model_embeddings(model, target_vocab_size, device)
+
     model.device = device
     model.eval()
     return model

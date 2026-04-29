@@ -12,7 +12,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from talkie.quant import Int8Linear, quantize_state_dict_int8
 from talkie.sampling import apply_top_k_top_p, sample_gumbel
+
+
+def _make_linear(in_f: int, out_f: int, quantize: bool) -> nn.Module:
+    if quantize:
+        return Int8Linear(in_f, out_f)
+    return nn.Linear(in_f, out_f, bias=False)
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +86,16 @@ class ActGain(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, quantize: bool = False):
         super().__init__()
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         n_state = config.n_embd
 
-        self.attn_query = nn.Linear(n_state, n_state, bias=False)
-        self.attn_key = nn.Linear(n_state, n_state, bias=False)
-        self.attn_value = nn.Linear(n_state, n_state, bias=False)
-        self.attn_resid = nn.Linear(n_state, n_state, bias=False)
+        self.attn_query = _make_linear(n_state, n_state, quantize)
+        self.attn_key = _make_linear(n_state, n_state, quantize)
+        self.attn_value = _make_linear(n_state, n_state, quantize)
+        self.attn_resid = _make_linear(n_state, n_state, quantize)
         self.head_gain = HeadGain(config.n_head)
 
     def forward(self, x: torch.Tensor, cos_sin: tuple) -> torch.Tensor:
@@ -110,14 +117,14 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, quantize: bool = False):
         super().__init__()
         n_state = config.n_embd
         n_mlp = int(round(((8 / 3) * n_state) / 128) * 128)
 
-        self.mlp_gate = nn.Linear(n_state, n_mlp, bias=False)
-        self.mlp_linear = nn.Linear(n_state, n_mlp, bias=False)
-        self.mlp_resid = nn.Linear(n_mlp, n_state, bias=False)
+        self.mlp_gate = _make_linear(n_state, n_mlp, quantize)
+        self.mlp_linear = _make_linear(n_state, n_mlp, quantize)
+        self.mlp_resid = _make_linear(n_mlp, n_state, quantize)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(self.mlp_gate(x)) * self.mlp_linear(x)
@@ -130,11 +137,11 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, quantize: bool = False):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, quantize=quantize)
         self.attn_gain = ActGain((2 * config.n_layer) ** -0.5)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, quantize=quantize)
         self.mlp_gain = ActGain((2 * config.n_layer) ** -0.5)
         self.embed_skip = ActGain(0.0)
 
@@ -151,14 +158,20 @@ class TalkieModel(nn.Module):
     """Talkie 13B decoder-only transformer."""
 
     def __init__(
-        self, config: GPTConfig, device: torch.device, max_seq_len: int = 2048
+        self,
+        config: GPTConfig,
+        device: torch.device,
+        max_seq_len: int = 2048,
+        quantize: bool = False,
     ):
         super().__init__()
         self.config = config
         self.device = device
 
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList(
+            [Block(config, quantize=quantize) for _ in range(config.n_layer)]
+        )
         self.lm_head = nn.Parameter(torch.zeros(config.vocab_size, config.n_embd))
         self.lm_head_gain = WeightGain()
 
@@ -265,12 +278,16 @@ def load_checkpoint(
     checkpoint_path: str,
     device: torch.device,
     target_vocab_size: int | None = None,
+    quantize: str | None = None,
 ) -> TalkieModel:
     """Load a Talkie model from a PyTorch checkpoint file.
 
     Handles ``torch.compile`` key prefixes and optional vocab resizing.
     Builds and converts to bfloat16 on CPU first, then moves to GPU to
     avoid a transient 2x memory spike from float32 initialisation.
+
+    *quantize* may be ``None`` (full bf16) or ``"int8"`` (per-output-row
+    int8 weight-only quantization on the attention and MLP linears).
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     if "model_state_dict" in ckpt:
@@ -284,15 +301,33 @@ def load_checkpoint(
     ckpt_vocab_size = state_dict["embed.weight"].shape[0]
     config = GPTConfig(vocab_size=ckpt_vocab_size)
 
+    is_quant = quantize == "int8"
+    if quantize is not None and not is_quant:
+        raise ValueError(
+            f"Unknown quantize mode {quantize!r} (expected None or 'int8')."
+        )
+    if is_quant:
+        # Cast every floating-point tensor to bf16 first so the quantizer has
+        # a consistent input dtype, then rewrite the linear weights as int8 +
+        # per-output-row bf16 scales.
+        for k in list(state_dict.keys()):
+            v = state_dict[k]
+            if v.is_floating_point() and v.dtype != torch.bfloat16:
+                state_dict[k] = v.to(torch.bfloat16)
+        quantize_state_dict_int8(state_dict)
+
     # Build on CPU, load weights, convert to bfloat16, THEN move to GPU.
     cpu = torch.device("cpu")
-    model = TalkieModel(config, cpu)
+    model = TalkieModel(config, cpu, quantize=is_quant)
     model.load_state_dict(state_dict, strict=True)
     del ckpt, state_dict
 
     if target_vocab_size is not None and ckpt_vocab_size < target_vocab_size:
         model = resize_model_embeddings(model, target_vocab_size, cpu)
 
+    # ``Module.to(dtype)`` only casts floating-point tensors, so int8 weight
+    # buffers in Int8Linear are left alone while embed / lm_head / gain
+    # parameters are converted to bf16.
     model = model.to(dtype=torch.bfloat16).to(device)
     model.device = device
     model.eval()

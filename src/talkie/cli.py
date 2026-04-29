@@ -30,6 +30,12 @@ def main(argv: list[str] | None = None) -> None:
     gen.add_argument("--device", default=None, help="Device (cuda / cpu).")
     gen.add_argument("--cache-dir", default=None, help="HuggingFace cache directory.")
     gen.add_argument(
+        "--quantize",
+        choices=["int8"],
+        default=None,
+        help="Weight-only int8 quantization (~14 GB weights instead of ~26 GB).",
+    )
+    gen.add_argument(
         "--no-stream", action="store_true", help="Print all at once instead of streaming."
     )
 
@@ -48,6 +54,12 @@ def main(argv: list[str] | None = None) -> None:
     ch.add_argument("--top-k", type=int, default=None, help="Top-k filtering.")
     ch.add_argument("--device", default=None, help="Device (cuda / cpu).")
     ch.add_argument("--cache-dir", default=None, help="HuggingFace cache directory.")
+    ch.add_argument(
+        "--quantize",
+        choices=["int8"],
+        default=None,
+        help="Weight-only int8 quantization (~14 GB weights instead of ~26 GB).",
+    )
     ch.add_argument("--system", default=None, help="System prompt.")
 
     # -- download ----------------------------------------------------------
@@ -84,7 +96,12 @@ def _cmd_generate(args: argparse.Namespace) -> None:
     from talkie.generate import Talkie
 
     print(f"Loading {args.model}...", file=sys.stderr)
-    model = Talkie(args.model, device=args.device, cache_dir=args.cache_dir)
+    model = Talkie(
+        args.model,
+        device=args.device,
+        cache_dir=args.cache_dir,
+        quantize=args.quantize,
+    )
 
     if args.no_stream:
         result = model.generate(
@@ -112,7 +129,12 @@ def _cmd_chat(args: argparse.Namespace) -> None:
     from talkie.generate import Talkie
 
     print(f"Loading {args.model}...", file=sys.stderr)
-    model = Talkie(args.model, device=args.device, cache_dir=args.cache_dir)
+    model = Talkie(
+        args.model,
+        device=args.device,
+        cache_dir=args.cache_dir,
+        quantize=args.quantize,
+    )
     print("Model loaded. Type your message (Ctrl-D to quit).\n", file=sys.stderr)
 
     messages: list[Message] = []

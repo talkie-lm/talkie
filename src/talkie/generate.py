@@ -59,6 +59,10 @@ class Talkie:
         PyTorch device string.  Defaults to ``"cuda"`` if available.
     cache_dir:
         Custom HuggingFace cache directory.
+    quantize:
+        ``None`` for full bf16 (~26 GB weights) or ``"int8"`` for
+        weight-only int8 quantization on the attention and MLP linears
+        (~14 GB weights, fits a 24 GB GPU).
     """
 
     def __init__(
@@ -66,6 +70,7 @@ class Talkie:
         model_name: str,
         device: str | None = None,
         cache_dir: str | None = None,
+        quantize: str | None = None,
     ):
         if model_name not in MODELS:
             available = ", ".join(sorted(MODELS))
@@ -88,7 +93,10 @@ class Talkie:
 
         # Load model.
         self.model = load_checkpoint(
-            str(ckpt_path), self.device, target_vocab_size=target_vocab
+            str(ckpt_path),
+            self.device,
+            target_vocab_size=target_vocab,
+            quantize=quantize,
         )
 
         # Stop tokens.

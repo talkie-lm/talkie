@@ -30,6 +30,48 @@ class GPTConfig:
 
 
 # ---------------------------------------------------------------------------
+# KV cache
+# ---------------------------------------------------------------------------
+
+
+class KVCache:
+    """Pre-allocated per-layer K/V cache for autoregressive decoding.
+
+    Shape per layer is ``[B, H, max_seq_len, D]``.  ``update`` writes the
+    new K/V slice at the requested position and returns views over the
+    populated prefix so SDPA can attend over the full history.
+    """
+
+    def __init__(
+        self,
+        n_layer: int,
+        batch: int,
+        n_head: int,
+        head_dim: int,
+        max_seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        shape = (n_layer, batch, n_head, max_seq_len, head_dim)
+        self.k = torch.empty(shape, device=device, dtype=dtype)
+        self.v = torch.empty(shape, device=device, dtype=dtype)
+        self.max_seq_len = max_seq_len
+
+    def update(
+        self,
+        layer_idx: int,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+        position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = new_k.size(2)
+        end = position + seq_len
+        self.k[layer_idx, :, :, position:end] = new_k
+        self.v[layer_idx, :, :, position:end] = new_v
+        return self.k[layer_idx, :, :, :end], self.v[layer_idx, :, :, :end]
+
+
+# ---------------------------------------------------------------------------
 # Layers
 # ---------------------------------------------------------------------------
 
@@ -79,8 +121,9 @@ class ActGain(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, layer_idx: int = 0):
         super().__init__()
+        self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.head_dim = config.head_dim
         n_state = config.n_embd
@@ -91,7 +134,13 @@ class CausalSelfAttention(nn.Module):
         self.attn_resid = nn.Linear(n_state, n_state, bias=False)
         self.head_gain = HeadGain(config.n_head)
 
-    def forward(self, x: torch.Tensor, cos_sin: tuple) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos_sin: tuple,
+        kv_cache: KVCache | None = None,
+        position: int = 0,
+    ) -> torch.Tensor:
         bsz, seq_len, _ = x.size()
         q = self.attn_query(x).view(bsz, seq_len, self.n_head, self.head_dim)
         k = self.attn_key(x).view(bsz, seq_len, self.n_head, self.head_dim)
@@ -102,10 +151,20 @@ class CausalSelfAttention(nn.Module):
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         q = self.head_gain(q)
 
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
-        )
-        y = y.transpose(1, 2).contiguous().view_as(x)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        if kv_cache is not None:
+            k, v = kv_cache.update(self.layer_idx, k, v, position)
+            # Decode step: q has 1 row attending to a longer cached k — no
+            # mask needed (no future positions). Prefill uses standard causal.
+            is_causal = seq_len > 1
+        else:
+            is_causal = True
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        y = y.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.attn_resid(y)
 
 
@@ -130,18 +189,30 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: GPTConfig, layer_idx: int = 0):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer_idx=layer_idx)
         self.attn_gain = ActGain((2 * config.n_layer) ** -0.5)
         self.mlp = MLP(config)
         self.mlp_gain = ActGain((2 * config.n_layer) ** -0.5)
         self.embed_skip = ActGain(0.0)
 
     def forward(
-        self, e_x: torch.Tensor, x: torch.Tensor, cos_sin: tuple
+        self,
+        e_x: torch.Tensor,
+        x: torch.Tensor,
+        cos_sin: tuple,
+        kv_cache: KVCache | None = None,
+        position: int = 0,
     ) -> torch.Tensor:
-        x = x + self.attn_gain(self.attn(F.rms_norm(x, (x.shape[-1],)), cos_sin))
+        x = x + self.attn_gain(
+            self.attn(
+                F.rms_norm(x, (x.shape[-1],)),
+                cos_sin,
+                kv_cache=kv_cache,
+                position=position,
+            )
+        )
         x = x + self.mlp_gain(self.mlp(F.rms_norm(x, (x.shape[-1],))))
         x = x + self.embed_skip(e_x)
         return x
@@ -156,9 +227,12 @@ class TalkieModel(nn.Module):
         super().__init__()
         self.config = config
         self.device = device
+        self.max_seq_len = max_seq_len
 
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList(
+            [Block(config, layer_idx=i) for i in range(config.n_layer)]
+        )
         self.lm_head = nn.Parameter(torch.zeros(config.vocab_size, config.n_embd))
         self.lm_head_gain = WeightGain()
 
@@ -181,16 +255,41 @@ class TalkieModel(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Run a forward pass and return ``[B, V]`` logits for the last position."""
+    def make_kv_cache(self, batch: int, max_seq_len: int | None = None) -> KVCache:
+        return KVCache(
+            n_layer=self.config.n_layer,
+            batch=batch,
+            n_head=self.config.n_head,
+            head_dim=self.config.head_dim,
+            max_seq_len=max_seq_len or self.max_seq_len,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        position: int = 0,
+    ) -> torch.Tensor:
+        """Run a forward pass and return ``[B, V]`` logits for the last position.
+
+        With *kv_cache* set, only the *new* tokens supplied in *input_ids* are
+        processed; cached K/V from earlier positions are reused.  *position*
+        is the index of the first token in *input_ids* within the full
+        sequence (0 for prefill, ``prompt_len + i`` during decode).
+        """
         _, seq_len = input_ids.shape
-        cos_sin = self.cos[:, :seq_len], self.sin[:, :seq_len]
+        cos_sin = (
+            self.cos[:, position : position + seq_len],
+            self.sin[:, position : position + seq_len],
+        )
 
         x = self.embed(input_ids)
         x = F.rms_norm(x, (x.shape[-1],))
         e_x = x
         for block in self.blocks:
-            x = block(e_x, x, cos_sin)
+            x = block(e_x, x, cos_sin, kv_cache=kv_cache, position=position)
         x = F.rms_norm(x, (x.shape[-1],))
 
         return F.linear(x[:, -1, :], self.lm_head_gain(self.lm_head)).float()
@@ -201,9 +300,11 @@ class TalkieModel(nn.Module):
         t: float = 0.7,
         top_p: torch.Tensor | None = None,
         top_k: torch.Tensor | None = None,
+        kv_cache: KVCache | None = None,
+        position: int = 0,
     ) -> torch.Tensor:
         """Sample one token per sequence in the batch."""
-        logits = self.forward(x)
+        logits = self.forward(x, kv_cache=kv_cache, position=position)
         if t != 1:
             logits = logits / t
         if top_p is not None or top_k is not None:
@@ -217,9 +318,11 @@ class TalkieModel(nn.Module):
         t: torch.Tensor,
         top_p: torch.Tensor | None = None,
         top_k: torch.Tensor | None = None,
+        kv_cache: KVCache | None = None,
+        position: int = 0,
     ) -> torch.Tensor:
         """Like :meth:`sample_batch` but *t* is a ``[B, 1]`` per-sequence temperature."""
-        logits = self.forward(x)
+        logits = self.forward(x, kv_cache=kv_cache, position=position)
         logits = logits / t
         if top_p is not None or top_k is not None:
             logits = apply_top_k_top_p(logits, top_p=top_p, top_k=top_k)

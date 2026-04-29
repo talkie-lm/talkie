@@ -211,11 +211,11 @@ class Talkie:
 
         tokens = self.tokenizer.encode(formatted, allowed_special="all")
         prompt_len = len(tokens)
-        tokens_tensor = (
+        prompt_tensor = (
             torch.tensor(tokens, dtype=torch.long, device=self.device)
             .unsqueeze(0)
             .expand(B, -1)
-            .clone()
+            .contiguous()
         )
 
         temps = torch.tensor(
@@ -234,42 +234,59 @@ class Talkie:
 
         finished = [False] * B
         finish_reasons = ["length"] * B
-        gen_counts = [0] * B
+        gen_tokens: list[list[int]] = [[] for _ in range(B)]
+
+        cache = self.model.make_kv_cache(
+            batch=B, max_seq_len=prompt_len + global_max
+        )
 
         with torch.no_grad(), self._autocast:
-            for _ in range(global_max):
-                next_tokens = self.model.sample_batch_variable_temp(
-                    tokens_tensor, temps, top_p=top_p_t, top_k=top_k_t
-                )
-                next_tokens = next_tokens.unsqueeze(1)
-                tokens_tensor = torch.cat([tokens_tensor, next_tokens], dim=1)
+            # Prefill: feed the whole prompt through once, populating the cache.
+            next_tokens = self.model.sample_batch_variable_temp(
+                prompt_tensor,
+                temps,
+                top_p=top_p_t,
+                top_k=top_k_t,
+                kv_cache=cache,
+                position=0,
+            )
+            position = prompt_len
 
+            for step in range(global_max):
+                tokens_cpu = next_tokens.tolist()
                 for i in range(B):
                     if finished[i]:
                         continue
-                    gen_counts[i] += 1
-                    tok = int(next_tokens[i, 0])
+                    tok = tokens_cpu[i]
                     if tok in self._stop_ids:
                         finished[i] = True
                         finish_reasons[i] = "stop"
-                    elif gen_counts[i] >= max_per[i]:
+                        continue
+                    gen_tokens[i].append(tok)
+                    if len(gen_tokens[i]) >= max_per[i]:
                         finished[i] = True
 
-                if all(finished):
+                if all(finished) or step == global_max - 1:
                     break
+
+                # Decode: feed only the just-sampled token back in.
+                next_tokens = self.model.sample_batch_variable_temp(
+                    next_tokens.unsqueeze(1),
+                    temps,
+                    top_p=top_p_t,
+                    top_k=top_k_t,
+                    kv_cache=cache,
+                    position=position,
+                )
+                position += 1
 
         results: list[GenerationResult] = []
         for i in range(B):
-            gen_tokens = tokens_tensor[
-                i, prompt_len : prompt_len + gen_counts[i]
-            ].tolist()
-            if gen_tokens and gen_tokens[-1] in self._stop_ids:
-                gen_tokens = gen_tokens[:-1]
-            text = self.tokenizer.decode(gen_tokens)
+            text = self.tokenizer.decode(gen_tokens[i])
             results.append(
                 GenerationResult(
                     text=text,
-                    token_count=len(gen_tokens),
+                    token_count=len(gen_tokens[i]),
                     finish_reason=finish_reasons[i],
                 )
             )
@@ -296,8 +313,9 @@ class Talkie:
     ) -> Generator[str, None, None]:
         """Stream tokens from an already-formatted prompt string."""
         tokens = self.tokenizer.encode(formatted_prompt, allowed_special="all")
-        tokens_tensor = (
-            torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
+        prompt_len = len(tokens)
+        prompt_tensor = torch.tensor(
+            [tokens], dtype=torch.long, device=self.device
         )
 
         top_p_t = scalar_top_p_tensor(top_p, self.device)
@@ -306,31 +324,37 @@ class Talkie:
         is_it = self.spec.style == "it"
         buffered_text = ""
 
-        with torch.no_grad(), self._autocast:
-            for _ in range(max_tokens):
-                next_token = self.model.sample_batch(
-                    tokens_tensor, t=temperature, top_p=top_p_t, top_k=top_k_t
-                )[0]
-                next_token_tensor = torch.tensor(
-                    [[next_token]], device=self.device
-                )
-                tokens_tensor = torch.cat(
-                    [tokens_tensor, next_token_tensor], dim=1
-                )
+        cache = self.model.make_kv_cache(
+            batch=1, max_seq_len=prompt_len + max_tokens
+        )
 
-                if int(next_token) in self._stop_ids:
+        with torch.no_grad(), self._autocast:
+            # Prefill: process the whole prompt in one forward pass.
+            next_token = self.model.sample_batch(
+                prompt_tensor,
+                t=temperature,
+                top_p=top_p_t,
+                top_k=top_k_t,
+                kv_cache=cache,
+                position=0,
+            )
+            position = prompt_len
+
+            for step in range(max_tokens):
+                tok_int = int(next_token.item())
+
+                if tok_int in self._stop_ids:
                     break
 
-                decoded = self.tokenizer.decode([int(next_token)])
+                decoded = self.tokenizer.decode([tok_int])
 
                 if is_it:
-                    # Buffer output to catch chat-template leaks.
                     buffered_text += decoded
                     truncated, should_stop = truncate_at_stop(buffered_text)
                     if should_stop:
                         if truncated:
                             yield truncated
-                        break
+                        return
                     flush_upto = max(
                         0, len(buffered_text) - (STOP_WINDOW - 1)
                     )
@@ -339,6 +363,20 @@ class Talkie:
                         buffered_text = buffered_text[flush_upto:]
                 else:
                     yield decoded
+
+                if step == max_tokens - 1:
+                    break
+
+                # Decode step: feed only the just-sampled token.
+                next_token = self.model.sample_batch(
+                    next_token.view(1, 1),
+                    t=temperature,
+                    top_p=top_p_t,
+                    top_k=top_k_t,
+                    kv_cache=cache,
+                    position=position,
+                )
+                position += 1
 
         # Flush remaining buffer for IT models.
         if is_it and buffered_text:

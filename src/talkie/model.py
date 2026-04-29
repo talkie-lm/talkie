@@ -156,6 +156,7 @@ class TalkieModel(nn.Module):
         super().__init__()
         self.config = config
         self.device = device
+        self.max_seq_len = max_seq_len
 
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
@@ -181,8 +182,20 @@ class TalkieModel(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Run a forward pass and return ``[B, V]`` logits for the last position."""
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        return_all_logits: bool = False,
+        last_k: int | None = None,
+    ) -> torch.Tensor:
+        """Run a forward pass and return logits.
+
+        Default: ``[B, V]`` for the last position only.
+        *return_all_logits=True*: ``[B, T, V]`` for every position.
+        *last_k=K*: ``[B, K, V]`` for the last K positions (memory-efficient
+        for long-context perplexity, where materializing all-positions logits
+        would dwarf the model weights).
+        """
         _, seq_len = input_ids.shape
         cos_sin = self.cos[:, :seq_len], self.sin[:, :seq_len]
 
@@ -193,7 +206,12 @@ class TalkieModel(nn.Module):
             x = block(e_x, x, cos_sin)
         x = F.rms_norm(x, (x.shape[-1],))
 
-        return F.linear(x[:, -1, :], self.lm_head_gain(self.lm_head)).float()
+        head = self.lm_head_gain(self.lm_head)
+        if last_k is not None:
+            return F.linear(x[:, -last_k:, :], head).float()
+        if return_all_logits:
+            return F.linear(x, head).float()
+        return F.linear(x[:, -1, :], head).float()
 
     def sample_batch(
         self,
@@ -265,6 +283,7 @@ def load_checkpoint(
     checkpoint_path: str,
     device: torch.device,
     target_vocab_size: int | None = None,
+    max_seq_len: int = 2048,
 ) -> TalkieModel:
     """Load a Talkie model from a PyTorch checkpoint file.
 
@@ -286,7 +305,7 @@ def load_checkpoint(
 
     # Build on CPU, load weights, convert to bfloat16, THEN move to GPU.
     cpu = torch.device("cpu")
-    model = TalkieModel(config, cpu)
+    model = TalkieModel(config, cpu, max_seq_len=max_seq_len)
     model.load_state_dict(state_dict, strict=True)
     del ckpt, state_dict
 

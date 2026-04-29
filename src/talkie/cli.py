@@ -58,6 +58,30 @@ def main(argv: list[str] | None = None) -> None:
     )
     dl.add_argument("--cache-dir", default=None, help="HuggingFace cache directory.")
 
+    # -- benchmark ---------------------------------------------------------
+    bench = sub.add_parser(
+        "benchmark",
+        help="Compare bf16 vs int8 quantization quality on a text passage.",
+    )
+    bench.add_argument(
+        "-m", "--model", default="talkie-1930-13b-base", help="Model name."
+    )
+    bench.add_argument(
+        "--text",
+        required=True,
+        help="Path to a UTF-8 text file to evaluate on.",
+    )
+    bench.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1024,
+        help="Truncate the passage to this many tokens (default 1024).",
+    )
+    bench.add_argument("--device", default=None, help="Device (cuda / cpu).")
+    bench.add_argument(
+        "--cache-dir", default=None, help="HuggingFace cache directory."
+    )
+
     # -- list --------------------------------------------------------------
     sub.add_parser("list", help="List available models.")
 
@@ -69,6 +93,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_chat(args)
     elif args.command == "download":
         _cmd_download(args)
+    elif args.command == "benchmark":
+        _cmd_benchmark(args)
     elif args.command == "list":
         _cmd_list()
     else:
@@ -153,6 +179,22 @@ def _cmd_download(args: argparse.Namespace) -> None:
         path = download_model(name, cache_dir=args.cache_dir)
         print(f"  -> {path}")
     print("Done.")
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> None:
+    from talkie.benchmark import benchmark
+
+    with open(args.text, encoding="utf-8") as f:
+        text = f.read()
+    report = benchmark(
+        args.model,
+        text,
+        max_tokens=args.max_tokens,
+        device=args.device,
+        cache_dir=args.cache_dir,
+    )
+    print()
+    print(report)
 
 
 def _cmd_list() -> None:

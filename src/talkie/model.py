@@ -151,7 +151,7 @@ class TalkieModel(nn.Module):
     """Talkie 13B decoder-only transformer."""
 
     def __init__(
-        self, config: GPTConfig, device: torch.device, max_seq_len: int = 2048
+        self, config: GPTConfig, device: torch.device, max_seq_len: int = 4096
     ):
         super().__init__()
         self.config = config
